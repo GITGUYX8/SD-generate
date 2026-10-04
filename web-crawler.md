@@ -1,12 +1,12 @@
 # Design: Web Crawler — full HLD + LLD (staged, agnostic)
 
 - Slice: `--full`
-- Scope line: you're building a polite (waits its turn per site: caps requests per second to any one host) large-scale web crawler for a search index at 500M pages per day. Stored pages lag the live web by days — that's eventual freshness (agreeing soon, not instantly), and it's on purpose.
+- Scope line: you are building a polite (waits its turn per site: caps requests per second to any one host) large-scale web crawler for a search index at 500M pages per day. Stored pages lag the live web by days. That is eventual freshness (agreeing soon, not instantly), by design.
 - > Archetype: write-heavy ingest / streaming (most work is absorbing a firehose of fetches, not answering queries) — because sustained fetch rate × page bytes × per-host politeness dominates, then frontier partitioning (splitting the giant to-visit list by host) + dedup (duplicate removal) dominates.
 
 ## Step 0 — Assumptions (FR / NFR / out-of-scope)
 
-One-sentence restatement: continuously discover, fetch, parse and store web pages politely so an index pipeline always has fresh content. And here's the plain idea that runs the whole design: the web is huge and strangers are slow, so you win by being patient in parallel — lots of polite fetchers, none of them ever waiting on another.
+One-sentence restatement: continuously discover, fetch, parse and store web pages politely so an index pipeline always has fresh content. First principle: the web is large and remote hosts are slow. So you win with many polite fetchers in parallel, none waiting on another.
 
 | Question | Assumption (prefix `Assumption:` if unconfirmed) | Why it drives the design |
 |---|---|---|
@@ -17,11 +17,11 @@ One-sentence restatement: continuously discover, fetch, parse and store web page
 | Consistency / durability | Eventual dedup via content hash (fingerprint of the bytes: same bytes, same hash); frontier recoverable not durable per URL; content RPO (recovery-point objective: how much recent data you may lose) ~0 once stored | Splits durable content store from replayable frontier queue |
 | Out-of-scope (3–5) | 1. Ranking / query serving 2. Full-browser JS render farm 3. Ad / spam / abuse classification 4. Multi-region active serving 5. Per-publisher analytics | Deferred with forcing condition: add render pool when JS-only share forces it; add ranking when index serving appears |
 
-Scope method follows `requirements-scoping`: three lists — FR (functional requirements: what the system does), NFR (non-functional requirements: how fast, how fresh, at what scale) — plus revisable `Assumption:` lines, no silent facts. Write the guesses down, argue with them later.
+Scope method follows `requirements-scoping`: three lists — FR (functional requirements: what the system does), NFR (non-functional requirements: how fast, how fresh, at what scale) — plus revisable `Assumption:` lines, no silent facts. You write guesses down so you can argue with them later.
 
 ## Step 1 — Naive v1 + mermaid #1 (≤3 nodes, archetype-shaped)
 
-Archetype: write-heavy ingest → v1 = seeds → single fetcher → single store, no queue mesh. First principle, and it's a comforting one: one fetcher can never double-visit a page or anger a website — there's nobody to disagree with. So start there, until page count or bytes force parallelism on you.
+Archetype: write-heavy ingest → v1 = seeds → single fetcher → single store, no queue mesh. First principle: one fetcher cannot double-visit a page or overload a site. There is nobody to disagree with. So start there. Add parallelism only when page count or bytes force you.
 
 ```mermaid
 flowchart LR
@@ -47,11 +47,11 @@ Formulas: `QPS_avg = pages_per_day ÷ 86,400`; `QPS_peak = avg × peak_factor (h
 | Dedup memory | `Assumption:` 8B URLs × ~10 bits per entry Bloom ≈ 1.0e10 B ≈ **10GB per replica** | Fits RAM sharded Bloom; forces sharded seen-set |
 | Politeness cap | `Assumption:` 1 req per 2s per host avg → one host ≤ 0.5 per s; 11.6K per s ÷ 0.5 = **23K active hosts minimum** | With 100M hosts this holds; forces per-host queues not global FIFO (first in, first out: one shared line) |
 
-Conclusion: 11.6K peak fetches per s plus 10TB per day new plus 900TB total force a host-partitioned frontier with a large fetch fleet feeding an object content store; dedup at 40 percent new halves the store — that's the single cheapest win in this design, don't skip it. Single-node v1 holds until pages per day exceed ~100K or bytes exceed one disk. Skipped: per-row TX (transaction) analysis, cross-region sync, query fan-out (one request splitting into many) — YAGNI (you aren't gonna need it: do not build what no number forces) for a crawler with no serving path and no named cloud.
+Conclusion: 11.6K peak fetches per s plus 10TB per day new plus 900TB total force a host-partitioned frontier with a large fetch fleet feeding an object content store; dedup at 40 percent new halves the store. Single-node v1 holds until pages per day exceed ~100K or bytes exceed one disk. Skipped: per-row TX (transaction) analysis, cross-region sync, query fan-out (one request splitting into many) — YAGNI (you aren't gonna need it: do not build what no number forces) for a crawler with no serving path and no named cloud.
 
 ## Step 3 — API / interface contracts (LLD surface)
 
-Per `api-design`: REST/JSON default, verbs by retry safety, cursor (opaque bookmark into a sorted order, never a row offset) pagination, stable error envelope, `/v1`. The thing to internalize here: crawlers live on retries — networks flake, hosts hang — so every write below is built to be safely repeated. That's not paranoia, it's the job.
+Per `api-design`: REST/JSON default, verbs by retry safety, cursor (opaque bookmark into a sorted order, never a row offset) pagination, stable error envelope, `/v1`. First principle: crawlers live on retries. Networks fail, hosts hang. So every write below is safe to repeat.
 
 - `POST /v1/seeds` `{"urls":["https://ex.com/a"],"source":"ops"}` → 202 `{accepted:120, batch_id}` — unsafe write, client sends `Idempotency-Key` (client-sent dedupe token: same token plus same body returns the stored answer instead of re-executing) per batch; replay returns stored accept counts. Serves FR-1. Rationale: dedupes seed resubmits.
 - `GET /v1/frontier/lease?worker=w12&limit=50` → 200 `{leases:[{url, lease_id, visible_after}], next_cursor}` — cursor over host shards, never offset. Serves fetch scheduling. Rationale: pull leasing (workers asking for work beats a boss assigning it) gives backpressure (pushback that sheds load instead of buffering forever) for free.
@@ -62,7 +62,7 @@ Per `api-design`: REST/JSON default, verbs by retry safety, cursor (opaque bookm
 
 ## Step 4 — Evolved reads HLD + mermaid #2 (≤10 nodes; Step-2 read verdict forces it)
 
-Verdicts forcing reads: robots plus DNS lookups at 11.6K per s, seen-URL checks over 8B entries, content reads by pipeline. The plain idea, and it never changes: never pay for the same answer twice — check memory first, network last.
+Verdicts forcing reads: robots plus DNS lookups at 11.6K per s, seen-URL checks over 8B entries, content reads by pipeline. First principle: never pay for the same answer twice. Check memory first, network last.
 
 ```mermaid
 flowchart LR
@@ -81,7 +81,7 @@ Per added component — Why / Without-it / Change-when (cites verdict):
 
 ## Step 5 — Evolved writes HLD + mermaid #3 (≤10 nodes; write/durability verdict forces it)
 
-Verdicts forcing writes: 11.6K peak fetches per s, 10TB per day, politeness over 100M hosts, poison URLs (addresses that always fail). Remember the first principle from Step 0: slow strangers must never block your fast path — hand every fetch a lease, and move on.
+Verdicts forcing writes: 11.6K peak fetches per s, 10TB per day, politeness over 100M hosts, poison URLs (addresses that always fail). First principle: slow hosts must never block you. Hand every fetch a lease, move on.
 
 ```mermaid
 flowchart TB
@@ -103,7 +103,7 @@ flowchart TB
 
 ## Step 6 — LLD deep-dive + mermaid #4 (≤10 nodes, one subsystem only)
 
-Target: politeness scheduler plus lease plus dedup (archetype pain). Okay, closest zoom of the whole doc: politeness is really just a calendar per website plus a borrowing system — jobs go out on loan, late returns come back by themselves. Everything below is that idea, mechanized.
+Target: politeness scheduler plus lease plus dedup (archetype pain). Zoom in: politeness is per-host timing plus leases. Jobs go out with a timeout. Late ones return alone.
 
 ```mermaid
 flowchart TB
@@ -117,7 +117,7 @@ flowchart TB
     DD -.->|8 new URLs| Q
 ```
 
-- Hot-path walk (the exact steps one fetch travels — trace it with your finger): host queue head with `next_allowed_at` (~200B entry) → timer wheel (ring of buckets for not-before times: due hosts fall out when their slot arrives) fires due hosts → lease mgr issues `lease_id` with visibility timeout (borrow time: while you hold the job it stays invisible; run out and it returns to the queue) 60s → fetcher checks robots cache hit then DNS cache hit then fetches ≤50KB with 8s timeout → page plus links (~55KB) → content-hash `sha256` (secure fingerprint function) compare against seen Bloom then exact store → new URLs requeued to per-host tails.
+- Hot-path walk (exact steps one fetch travels): host queue head with `next_allowed_at` (~200B entry) → timer wheel (ring of buckets for not-before times: due hosts fall out when their slot arrives) fires due hosts → lease mgr issues `lease_id` with visibility timeout (borrow time: while you hold the job it stays invisible; run out and it returns to the queue) 60s → fetcher checks robots cache hit then DNS cache hit then fetches ≤50KB with 8s timeout → page plus links (~55KB) → content-hash `sha256` (secure fingerprint function) compare against seen Bloom then exact store → new URLs requeued to per-host tails.
 - Key and knob table:
 
 | Field | Value / knob | Why |
@@ -129,7 +129,7 @@ flowchart TB
 | Doc ID | `content_hash` plus ULID time prefix | Dedup key plus time-sortable index key |
 | Fetch budget | 8s timeout, max 2MB, max 20 redirects | Bounds worst-case worker hold |
 
-- Failure injection (now break it on purpose — because the web *will* break it for you): kill fetcher → lease expires, redelivery to healthy worker, user sees freshness lag not error; robots cache cold → shed to 10 percent fetch plus serve last-known allow; DNS slow → per-host backoff plus `429`; dedup Bloom loss → rebuild from exact index, temporary refetch spike capped by single-flight (one shared backend trip for duplicate waiters); timer stall → pull model still leases due hosts, lag alert fires.
+- Failure injection (break it here first): kill fetcher → lease expires, redelivery to healthy worker, user sees freshness lag not error; robots cache cold → shed to 10 percent fetch plus serve last-known allow; DNS slow → per-host backoff plus `429`; dedup Bloom loss → rebuild from exact index, temporary refetch spike capped by single-flight (one shared backend trip for duplicate waiters); timer stall → pull model still leases due hosts, lag alert fires.
 - Bottleneck metric: `oldest_due_age_s` (how late the most overdue host is), `per_host_queue_depth`, `lease_expiry_rate`, `fetch_p99_s`, `dedup_hit_ratio`; evolution signal when `oldest_due_age_s >600` sustained.
 
 Scheduling applies `task-scheduling` pull leasing plus visibility timeout plus dedup key in two sentences: workers lease due hosts, heartbeat (periodic still-working ping that extends the lease) long fetches, idempotent requeue by URL hash. Buffering applies `messaging-streaming` at-least-once plus DLQ plus backpressure: bound frontier, shed seeds with `429`, alarm on oldest age. Counting applies `sharded-counters` for per-host fetch tallies: striped counters (one logical count split into many physical tallies, summed on read) avoid one hot row (single record everyone fights over), cached aggregates for dashboards.
@@ -174,7 +174,7 @@ flowchart TB
 
 ## 8. Data model / structures
 
-Three things to store, that's it — which URLs exist and when each host may be touched again, the page bytes themselves, and quick yes/no memories for things already seen. Everything below is just those three ideas wearing different hats.
+Three things to store: which URLs exist and when each host may be touched again, the page bytes, and quick yes/no memories for things already seen.
 
 - URL store: key `host_hash + host + url_hash` → `{url, canonical, host, next_allowed_at, attempts, priority, doc_hash}`. Partition by host hash for politeness locality; secondary index (extra lookup structure) on `next_allowed_at` per partition for due scans. 8B rows × ~200B ≈ 1.6TB.
 - Content objects: key `content_hash` → immutable (write once, never edited) bytes ≤2MB plus metadata `{doc_id, fetched_at, status, outlinks}`. Erasure-coded (split into data plus parity pieces so any subset rebuilds: same safety, far less storage than full copies) object store per `blob-store` for 900TB at ~1.4× overhead; DB holds pointer only, never bytes.
@@ -184,7 +184,7 @@ Three things to store, that's it — which URLs exist and when each host may be 
 
 ## 9. Key decisions & trade-offs
 
-Same deal as ever — every row is something you gain, something you pay, and the tripwire that tells you to renegotiate. No free lunches in here.
+Each row below is a trade: what you gain, what you pay, when you change it.
 
 | Decision | Solves (cite FR/NFR/verdict) | Worsens (non-empty, blocking) | Change it when (breaking point) |
 |---|---|---|---|
@@ -199,7 +199,7 @@ Same deal as ever — every row is something you gain, something you pay, and th
 
 ## 10. Failure modes & degradation
 
-Alright, the 3am section — everything below *will* happen eventually, and the only question is whether anyone notices. Per `resilience-failure` timeout (give up waiting after X) plus breaker (circuit breaker: stop calling what is failing, fail fast, probe later) plus bulkhead (separate pools per dependency) plus degrade (planned worse-but-useful answer), and `load-balancing` health gating (only send traffic to boxes passing checks).
+Mindset: everything below will happen. The question is whether users notice. Per `resilience-failure` timeout (give up waiting after X) plus breaker (circuit breaker: stop calling what is failing, fail fast, probe later) plus bulkhead (separate pools per dependency) plus degrade (planned worse-but-useful answer), and `load-balancing` health gating (only send traffic to boxes passing checks).
 
 | Failure | User sees | Degrade path | Recovery (no stampede) |
 |---|---|---|---|
@@ -216,7 +216,7 @@ Timeouts fit fetch budget: connect 2s, total fetch 8s, lease 60s with 20s heartb
 
 ## 11. Scale evolution (10× / 100×)
 
-So what breaks first when you win and traffic 10×s? Good news: you already know the answer, because you named the tripwires above. Current bottleneck plus signals per `scaling-evolution` (walk-the-ladder: add only the next tier the numbers force, and name what breaks next): fetch NIC plus politeness breadth before store; signals `oldest_due_age_s >600`, `per_host_depth` rising, `fetch_p99_s >8`, `dedup_hit_ratio` falling.
+What breaks first when traffic 10×s? You already named it. Current bottleneck plus signals per `scaling-evolution` (walk-the-ladder: add only the next tier the numbers force, and name what breaks next): fetch NIC plus politeness breadth before store; signals `oldest_due_age_s >600`, `per_host_depth` rising, `fetch_p99_s >8`, `dedup_hit_ratio` falling.
 
 - 10× (≈116K peak fetches per s, 100TB per day): split frontier to ~10× partitions by host hash, add regional fetch cells near hosts to cut RTT (round-trip time), add limited render pool for JS share, move scheduler to dedicated quorum (majority-voted group), add per-tenant seed quotas. Signal: `per_partition_QPS` above worker ceiling or `bandwidth` above NIC headroom for 10 min.
 - 100× (≈1.2M peak fetches per s): federate (split by function/domain) by TLD (top-level domain: .com, .in…) plus geography rings, multi-region fetch with central dedup exchange, tier content to hot plus cool plus archive per `blob-store`, add `distributed-search` incremental indexing behind durable buffer. Signal: single-ring gossip above 5s or cross-region RTT dominates fetch p99.
@@ -235,4 +235,4 @@ Open: confirm pages per day and new frac (500M and 40 percent assumed), page siz
 - [x] No managed-service names/quotas unless user named a cloud (generic only).
 - [x] Weakest dimension + current bottleneck + next-magnitude change stated; never claims perfection.
 
-Coverage details (plain version: watch lateness first, everything else second): `observability` SLOs: 99.9% scheduler success, fetch p99 <10s, oldest-due <600s, dedup loss 0; RED (rate, errors, duration: the request lens) on API plus fetch plus parser, USE (utilization, saturation, errors: the resource lens) on queues plus store plus NIC; `livez` (am-I-alive probe: restart me if it fails) vs `readyz` (am-I-ready probe: quietly pull me from rotation if it fails) with ring plus store reachability; symptom alert on oldest-due burn (budget spend rate), tickets on saturation; telemetry async plus sampled (sent in background, 1 in N kept). `distributed-logging`: structured JSON per fetcher plus parser sampled 1 percent, `trace_id` (request passport stamped across services) plus `url_hash` correlation, async ship, 7d hot plus cold archive. `task-scheduling` revisit jobs: recrawl timer per host plus priority, jittered ticks. Weakest dimension, honestly: freshness under politeness plus near-dup waste; current bottleneck fetch breadth; next change: regional cells plus render pool at 10×. No design is perfect — this one just tells you exactly where it bends.
+Coverage details (watch lateness first): `observability` SLOs: 99.9% scheduler success, fetch p99 <10s, oldest-due <600s, dedup loss 0; RED (rate, errors, duration: the request lens) on API plus fetch plus parser, USE (utilization, saturation, errors: the resource lens) on queues plus store plus NIC; `livez` (am-I-alive probe: restart me if it fails) vs `readyz` (am-I-ready probe: quietly pull me from rotation if it fails) with ring plus store reachability; symptom alert on oldest-due burn (budget spend rate), tickets on saturation; telemetry async plus sampled (sent in background, 1 in N kept). `distributed-logging`: structured JSON per fetcher plus parser sampled 1 percent, `trace_id` (request passport stamped across services) plus `url_hash` correlation, async ship, 7d hot plus cold archive. `task-scheduling` revisit jobs: recrawl timer per host plus priority, jittered ticks. Weakest dimension: freshness under politeness plus near-dup waste; current bottleneck fetch breadth; next change: regional cells plus render pool at 10×.

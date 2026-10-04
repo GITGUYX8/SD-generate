@@ -1,12 +1,12 @@
 # Design: LRU Distributed Cache — full HLD + LLD (staged, agnostic)
 
 - Slice: `--full`
-- Scope line: you're building a distributed LRU (least recently used: evicts whatever was touched longest ago) cache for service fleets at 1M+ QPS (queries per second: requests arriving each second) / 1B keys. Each box keeps its own fresh-first order, and copies agree soon, not instantly.
-- > Archetype: single-node stateful (all state lives in one box's memory) → distributed read-heavy serve (many boxes mostly answering reads) — because per-key ops × live capacity dominates first, then consistent-hash sharding (spreading keys around a ring so each box owns a slice) + async replication (copies sync up in the background) dominates.
+- Scope line: you are building a distributed LRU (least recently used: drop what was touched longest ago) cache at 1M+ QPS / 1B keys. Each box tracks its own order. Copies catch up soon, not instantly.
+- > Archetype: single box → many boxes for reads — traffic × size decides first, then sharding + background copies decide.
 
 ## Step 0 — Assumptions (FR / NFR / out-of-scope)
 
-One-sentence restatement: a shared DRAM (main memory: very fast, forgets everything on restart) pool where app fleets stash opaque bytes by key, each with a TTL (time to live: auto-expire timer), evicted by approximate-LRU (each box drops its own stalest entries — nobody tracks one perfect global order, because that would need constant cross-box coordination, and trust me, you don't want that bill).
+In one line: shared memory pool where apps stash bytes by key, each with a TTL (expiry timer). Each box drops its own oldest.
 
 | Question | Assumption (prefix `Assumption:` if unconfirmed) | Why it drives the design |
 |---|---|---|
@@ -17,11 +17,11 @@ One-sentence restatement: a shared DRAM (main memory: very fast, forgets everyth
 | Consistency / durability | Ephemeral DRAM, eventual cross-replica, per-key last-write-wins; RPO = lose un-replicated window OK | Splits cheap eventual cache from any strongly-consistent store (out of scope) |
 | Out-of-scope (3–5) | 1. Origin database / source of truth 2. Cross-region strong replication 3. Large blobs / streaming media 4. Full-text search over values 5. Per-key ACLs / billing | Deferred with forcing condition: add origin adapter when miss-penalty SLO forces it; add cross-region when multi-DC NFR appears |
 
-Scope method follows `requirements-scoping`: three lists — FR (functional requirements: what the system does), NFR (non-functional requirements: how fast, how reliable, at what scale) — plus revisable `Assumption:` lines, no silent facts. Write the guesses down, argue with them later — that's the whole game.
+We follow `requirements-scoping`: FR (what it does), NFR (how well), plus revisable `Assumption:` lines. No hidden facts.
 
 ## Step 1 — Naive v1 + mermaid #1 (≤3 nodes, archetype-shaped)
 
-Archetype: single-node stateful → v1 = in-process HashMap (instant lookup table: key in, location out) + doubly-linked list (a chain you can snip and re-link in constant time, newest at the head) in DRAM, no network. Look, here's the first principle that carries this whole design: the fastest coordination is no coordination. One box can never disagree with itself, so start there — and only add boxes when memory size or request speed forces your hand.
+Start with one box: HashMap + linked list in memory, no network. First principle: no coordination is fastest. One box can't disagree with itself.
 
 ```mermaid
 flowchart LR
@@ -29,12 +29,12 @@ flowchart LR
     L -->|2 alloc| M[(DRAM<br/>1 node)]
 ```
 
-- Why starting simple is correct: (a) single-node exact LRU satisfies FR with zero coordination and p99 (99th-percentile latency: the near-worst case almost every request beats) <1ms; (b) `PUT`+`GET` are local atomics (one indivisible step, no halfway states), no quorum (majority vote between copies) / partition (network split isolating boxes) risk; (c) capacity/QPS of one box is the BOTEC (back-of-the-envelope calculation: rough sizing math that decides the shape) baseline before sharding.
-- Deliberately deferred: network router until ops exceed ~200k QPS or RAM exceeds one box; replication until 99.9% forces it; persistence until restart-loss SLO (service-level objective: the promise you measure yourself against) forces it; client single-flight (one shared backend trip for many duplicate waiting requests) until herd (thundering crowd of refills hitting at once) observed. Don't build what no number is asking for yet.
+- Why simple works: one box needs no agreement, GET/PUT are local, and it sets our speed baseline.
+- Deliberately deferred: router, copies, disk save, and request merging — until numbers force them.
 
 ## Step 2 — BOTEC break-table (only chains that can change a decision)
 
-Formulas: `QPS_avg = DAU (daily active users) × actions/day ÷ 86,400`; `QPS_peak = avg × peak_factor (how many times busier the busiest second is than average)`; `live_bytes = live_keys × (value+overhead)`; `bandwidth = QPS × payload`; `servers ≈ peak ÷ per-server_QPS (requests one box handles per second)` (cache ~100k–1M per `back-of-the-envelope`). Exact QPS check via `skills/back-of-the-envelope/scripts/botec.py` (see math below). Every row shows inputs → math → units, no exceptions.
+Formulas: `QPS_avg = DAU (daily active users) × actions/day ÷ 86,400`; `QPS_peak = avg × peak_factor (how many times busier the busiest second is than average)`; `live_bytes = live_keys × (value+overhead)`; `bandwidth = QPS × payload`; `servers ≈ peak ÷ per-server_QPS (requests one box handles per second)` (cache ~100k–1M per `back-of-the-envelope`). Check via `skills/back-of-the-envelope/scripts/botec.py`. Every row shows inputs → math → units.
 
 | Load | Math (inputs + units) | Verdict (breaks what / forces what) |
 |---|---|---|
@@ -49,22 +49,22 @@ Formulas: `QPS_avg = DAU (daily active users) × actions/day ÷ 86,400`; `QPS_pe
 | Bandwidth egress | 2.08M GET/s × 1024B = 2.13e9 B/s ≈ **2.1 GB/s** (+miss/PUT ≈ 2.4 GB/s per `botec.py`) | Fits intra-DC NICs; skip CDN/edge (values small, not static web) |
 | Churn / eviction | `Assumption:` TTL 3600s → expiry rate ≈ 1B ÷ 3600 ≈ **278k expires/s** steady | Forces O(1) TTL wheel + sampled LRU, not scan; forces jitter |
 
-Conclusion, and here's the punchline: V-cap (1.12 TB live / 3.36 TB with r=3) and 2.3M peak force a consistent-hash sharded DRAM fleet of 12 primaries / 36 physical nodes; QPS alone would need only 12 physical. Effective load ≈ 2.3M ÷ 36 ≈ 64k QPS/physical (replica reads spread load) and ≈ 192k QPS/primary on primary-only writes — within cache 100k–1M budget. Single-node v1 holds until keys × bytes exceed RAM or ops exceed ~200k QPS. Skipped: cross-region bandwidth, long-retention storage, per-row TX analysis — YAGNI for ephemeral TTL cache (no origin, no regions named).
+Conclusion: 1.12 TB live / 3.36 TB with copies + 2.3M peak → 12 primaries / 36 nodes. QPS alone needs 12. Load ≈ 64k /box, ≈ 192k /primary — fits budget. Single box holds until RAM or ~200k QPS breaks it. Skip cross-region, long storage, per-row TX — no numbers force them.
 
 ## Step 3 — API / interface contracts (LLD surface)
 
-Per `api-design`: REST/JSON default, verbs by retry safety, `Idempotency-Key` (client-sent dedupe token: same token plus same body returns the stored answer instead of re-executing) only where needed, cursor (opaque bookmark into a sorted order, never a row offset) only for scans, stable error envelope, `/v1`. Honestly? The contract, not the boxes, is what your clients actually marry — so every shape here is written out exactly.
+We use `api-design`: REST/JSON, safe verbs for retries, `/v1`. Clients live with this contract, so shapes are exact.
 
-- `GET /v1/cache/{key}` → 200 `{value_b64, version, ttl_left_s, stale:false}` / 404 miss — retry-safe (idempotent: safe to repeat, twice changes nothing; safe to single-flight + retry). Serves FR-1.
-- `PUT /v1/cache/{key}` `{"value_b64":"…","ttl_s":3600}` → 200 `{version}` — `PUT` naturally idempotent per-key LWW (last-write-wins: highest timestamp wins, no arguing); no `Idempotency-Key` needed (same key+value replay converges). Serves FR-2. Rationale: LWW keeps retries safe without dedupe table.
-- `DELETE /v1/cache/{key}` → 204 / 404 — idempotent tombstone (a marker that says deleted, so slow copies learn the deletion instead of resurrecting the key) (1s) to cover replica lag (delay before copies catch up). Serves FR-3.
-- `GET /v1/cache/_scan?cursor=…&limit=100` (ops only, not data path) — cursor over hash-slot, never offset. Deferred from hot path (the request flow that must stay fast).
-- Errors: `{error:{code,message,request_id,retryable}}` + `429` (too many requests: back off) `+ Retry-After` (wait this long) on shed (deliberately dropping excess load), `404` miss (not error), `503` no-shard. Versioning: `/v1` URI + additive fields; binary protocol (client lib over TCP) allowed internally for p99, same semantics.
-- Key contract: `namespace:version:key` e.g. `sess:v2:abc123`; max key 256B, max value `Assumption:` 1MB (larger → reject, forces `blob-store` (big-file storage) which is deferred); TTL required + jitter (randomized spread so expiries do not march in lockstep) ±10%.
+- `GET /v1/cache/{key}` → 200 `{value_b64, version, ttl_left_s, stale:false}` / 404 miss — safe to retry. Serves FR-1.
+- `PUT /v1/cache/{key}` `{"value_b64":"…","ttl_s":3600}` → 200 `{version}` — last-write-wins, so retries are safe. Serves FR-2.
+- `DELETE /v1/cache/{key}` → 204 / 404 — leaves a short delete marker so slow copies learn it. Serves FR-3.
+- `GET /v1/cache/_scan?cursor=…&limit=100` (ops only) — never offset. Kept off the fast path.
+- Errors: `{error:{code,message,request_id,retryable}}` + `429` + `Retry-After`, `404` miss, `503` no-shard. `/v1` + new fields only.
+- Key contract: `namespace:version:key` e.g. `sess:v2:abc123`; max key 256B, max value 1MB; TTL + ±10% spread.
 
 ## Step 4 — Evolved reads HLD + mermaid #2 (≤10 nodes; Step-2 read verdict forces it)
 
-Verdicts forcing reads: 2.08M GET/s peak + 1.12 TB hot set (hot set: the small share of data getting most reads) + hot-key (one superstar key getting most traffic) risk. Note: each GET routes to exactly one shard; the three `route` edges below show possible destinations, not fan-out. And the principle for this whole step: reads should never wait on coordination — route straight to the owner, copy in the background.
+Reads hit 2.08M/s. Each GET goes to one shard. Rule: reads never wait — route to owner, copy in background.
 
 ```mermaid
 flowchart LR
@@ -75,16 +75,16 @@ flowchart LR
     S1 -.->|3 async repl| RP[(Replica<br/>r=2)]
 ```
 
-Per added component — Why / Without-it / Change-when (cites verdict):
+Per added component — why it exists:
 
-- Router (stateless hash-ring, client lib or sidecar (helper process beside each app)) — Why: maps `h(key)` (hash of the key: scrambled number deciding its owner) → shard without central lookup at 2.3M QPS (V-QPS). Without-it: single LB (load balancer: spreads requests over healthy boxes) fans to wrong nodes, extra hop + hotspot. Change-when: ring churn >1%/min sustained → add proxy-tier caching of ring. Uses `consistency-coordination` consistent-hash ring (owned there) in 1–2 sentences: keys+nodes share one ring, only ~K/N (your keys divided by box count: each box's fair share) remap on change, vnodes (virtual nodes: each real box claims many ring spots, which evens out load) for evenness.
-- Sharded DRAM nodes (12 primaries × 3 = 36 physical) — Why: V-cap 1.12 TB cannot fit one box; shard spreads RAM+QPS (`data-storage` sharding: high-cardinality (many distinct values, so spread is even) key hash, even spread). Without-it: OOM (out of memory) + 2M QPS on one core. Change-when: per-primary >150k QPS or data-RAM >80% → split shards.
-- Async replicas r=3 (1+2) — Why: 99.9% (uptime share: ~43 min downtime a month) with ephemeral (lives only in memory, gone on restart) nodes; replica serves stale on primary loss. Without-it: one primary loss = 1/12 key-range miss storm. Change-when: loss-window SLO tightens → raise to r=5 or sync quorum (pay latency).
-- Single-flight (one shared backend trip for many duplicate waiting requests) + TTL jitter (randomized expiry spread) + negative cache (remembering misses briefly) in router/lib — Why: prevents herd (thundering crowd of refills hitting at once) on hot-key expiry at 2M GET/s per `caching` (coalesce (merge duplicates into one) concurrent misses, jitter ±10% stops lockstep expiry, short negative TTL stops penetration (floods of requests for keys that do not exist)). Without-it: one hot expiry → origin/shard spike. Change-when: coalesce wait >p99 budget → shed + stale-serve (answer from an older copy).
+- Router (hash ring in client lib) — Why: finds shard with no lookup at 2.3M QPS. Without it: extra hops + hotspots. Change when: churn >1%/min → cache ring in proxy.
+- Sharded nodes (12 × 3 = 36) — Why: 1.12 TB can't fit one box. Without them: OOM. Change when: >150k QPS or >80% RAM → split.
+- Copies r=3 — Why: survive box loss, serve stale. Without them: 1/12 keys miss on crash. Change when: loss budget tightens → sync writes.
+- Single-flight + spread TTL + remember misses — Why: stops hot-key stampedes. Without it: one expiry spikes origin. Change when: wait > budget → shed + serve stale.
 
 ## Step 5 — Evolved writes HLD + mermaid #3 (≤10 nodes; write/durability verdict forces it)
 
-Verdicts forcing writes: 231k PUT/s + 278k expires/s + ephemeral durability split. Writes are where people usually overbuild, so keep this in mind: a cache write is allowed to be a little lossy — that's literally what makes it fast.
+Writes hit 231k/s + 278k expiries/s. Rule: a cache write may be lossy. That's what makes it fast.
 
 ```mermaid
 flowchart TB
@@ -96,15 +96,14 @@ flowchart TB
     M -.->|4 gossip config| P
 ```
 
-- Partition key `h(key)` (hash of full `namespace:v:key`) — Why: even spread + locality (a key always living with its owner) of key to one primary (reason: spread, per `data-storage`). Without-it: hot shard melts. Change-when: celebrity key >1 shard QPS → replicate hot key read-only to N nodes + L1 (tiny private cache inside the client library).
-- Async primary→replica (at-least-once delivery: retry until acknowledged, so a write may arrive twice; per-key LWW (last-write-wins) version) — Why: 231k PUT/s at <10ms cannot pay quorum (majority-ack) round trips; LWW converges (`consistency-coordination` eventual model: copies agree soon). Ordering scoped to key, never global. Retention n/a (live TTL, not log). Without-it: sync quorum doubles p99. Change-when: un-replicated loss > budget → sync W=2 (wait for 2 copies before answering).
-- Membership/config (gossip (boxes swapping membership notes peer to peer in the background) + versioned ring, quorum only for membership) — Why: elastic add/remove remaps only ~K/N keys. Without-it: static N remaps all on scale (`hash%N` banned). Change-when: gossip convergence >5s → central config quorum (one majority-voted source of truth for who owns what).
-- No queue/stream/DLQ (dead-letter queue: parking lot for messages that always fail) on PUT path — explicitly deferred: `messaging-streaming` queue-vs-stream not forced because PUT is idempotent LWW in-memory with no cross-service TX (transaction); replay = client retry + replica anti-entropy (both sides comparing hashes to find disagreements). Forcing condition: if origin write-behind required → add buffered stream + DLQ.
-- No saga/2PC (two-phase commit: all-or-nothing vote across boxes) — deferred: single-key LWW has no multi-key atomicity; `consistency-coordination` saga/2PC inapplicable.
+- Key `h(key)` picks one primary for even spread. Hot celebrity key → copy it to many nodes + tiny client cache.
+- Primary copies to 2 replicas in background, last write wins. No waiting for all. Need less loss → wait for 2.
+- Membership by gossip + versioned ring. Only ~K/N keys move on change. Gossip too slow → central config.
+- No queue / saga on PUT — one key, retry is enough. Add stream only if write-behind appears.
 
 ## Step 6 — LLD deep-dive + mermaid #4 (≤10 nodes, one subsystem only)
 
-Target: eviction + concurrency + TTL correctness (archetype pain). Okay, zoom all the way in — inside one box the whole game is doing everything in constant time without threads tripping over each other, and letting old entries die cheaply.
+Target: eviction + concurrency + expiry. Zoom in: one box must stay fast, threads must not block, old entries must die cheap.
 
 ```mermaid
 flowchart TB
@@ -118,8 +117,8 @@ flowchart TB
     L -.->|6 evict tail| E[Evictor<br/>capacity]
 ```
 
-- Hot-path walk (the exact steps one request travels — follow a GET with your finger): TCP/binary `GET k` (~50B key + overhead) → Net IO hashes `h(k)` → striped worker (one of 64–256 mini-queues, each with its own lock, so threads rarely wait on each other; key picks its queue by `h(k) % stripes`) → `H` O(1) (constant-time: same cost no matter how full) lookup → on hit move node to MRU (most recently used: front of the line) head O(1), return ~1KB; on miss single-flight coalesces duplicate GETs, one fetch-through (a fill trip to replica/origin whose answer is shared with all waiters) populates. `PUT k,v,ttl` → worker → insert/update `H` + MRU push + register wheel slot `now+ttl` (async: queued, not waited on); TTL expiry deletes from `H` + unlinks from `L`; capacity pressure evicts `L` tail via `E`.
-- Key/index/TTL/partition table (or struct + lock table for single-node: fields, invariants, lock granularity, expiry).
+- Hot path: `GET k` → hash → worker → map lookup → move to front, return ~1KB. Miss: merge duplicate waits, fetch once. `PUT` → insert + front + set expiry slot. Full? Drop tail.
+- Key/index/TTL/partition table (fields + locks + expiry).
 
 | Field | Value / knob | Why |
 |---|---|---|
@@ -131,10 +130,10 @@ flowchart TB
 | Eviction | sampled approximate-LRU (`allkeys-lru`-style) + `volatile-ttl` assist | O(1) amortized; exact global LRU banned (coordination cost) |
 | Version | `lamport_ts + node_id` LWW | Idempotent replay, replica converge |
 
-- Failure injection (now break it on purpose — every box dies sooner or later): kill Worker → stripe lock released, in-flight GET retries to replica (user sees +1ms); kill HashMap shard → node marked unready, router fails over to replica (stale `stale:true` allowed); DList corrupt → process restart, ring remaps ~K/N, cold shard (empty box with nothing cached yet) warms via replicas (no stampede: slow-start ramp (re-admit traffic gradually) + single-flight); TTL wheel stall → lazy-expire (check expiry when the key is touched) still serves, background tick alerts; Evictor lag → `429` shed + `maxmemory` hard cap, never OOM.
-- Bottleneck metric: `eviction_rate`, `p99_lookup_us`, `stripe_lock_wait_us`, `hit_ratio` (share of requests answered from cache); evolution signal when `hit_ratio <90%` or `lock_wait >200µs` sustained.
+- If a box dies: retry on copy, warm empty box slowly, never let expiry scans block. Shed with `429`, never OOM.
+- Watch: `hit_ratio`, `eviction_rate`, `p99_lookup`, lock wait. Act when hit <90% or lock wait high.
 
-Struct + eviction behavior applies `caching` (LRU/TTL/herd/hot-key recipe) in 2 sentences: recency-skewed (recently touched means likely touched again) → LRU + TTL with jitter, single-flight + negative cache for herd/penetration, replicate hot keys. Shard sizing applies `data-storage` (key hash + even distribution, no cross-shard TX). Coordination applies `consistency-coordination` (eventual + LWW + consistent hashing).
+Applies `caching` for eviction, `data-storage` for sharding, `consistency-coordination` for background copies.
 
 ## Step 7 — Final topology + mermaid #5 (≤14 nodes, topology only)
 
@@ -180,17 +179,17 @@ flowchart TB
 
 ## 8. Data model / structures
 
-Quick framing before the nuts and bolts: the data model is just three questions — what is the key, who owns it, and when does it die. Nail those and the rest is bookkeeping.
+Three questions only: what is the key, who owns it, when does it die.
 
-- Live entry: `key (ns:v:k) → {value: bytes≤1MB, version: (ts,node), expire_at: unix_ms, dll: MRU pointers}`. Primary key = `h(key)` → shard; sort n/a (point lookups only: fetch exactly this key, never scan). No secondary indexes (extra lookup structures per query; hot-query = point GET only; scan is ops-only).
-- Shard map: consistent-hash ring with 100–200 vnodes/node; `primary = ring(h(key))`. Membership versioned (`ring_v42`); clients cache ring, poll `CF` every 5s + gossip delta.
-- TTL/retention: per-entry `ttl_s` (default 3600, jitter ±10%), negative entries 5s, tombstones 1s. No log retention (ephemeral: entries die by TTL, nothing kept for history); anti-entropy Merkle (tree of hashes both sides compare top-down to find exactly which entries disagree) every 30s for replica drift.
-- Persistence choice: none (pure DRAM). Restart = empty + warm from replicas/origin. Forcing condition for RDB (point-in-time snapshot file) / AOF (append-only log of every write) snapshot: restart-loss window SLO appears.
-- Generic recipe per `caching/references/providers/generic.md`: Memcached-style multithreaded LRU for raw GET/PUT throughput, or Redis-style single-thread + Cluster slots (fixed buckets mapping keys to boxes) if rich types needed; here striped multithread + hash slots (generic, no cloud).
+- Live entry: `key → {value ≤1MB, version, expire_at}`. Owner = `h(key)` → shard. Point lookups only.
+- Shard map: hash ring, 100–200 spots per box. Clients cache ring, refresh every 5s.
+- Expiry: default 3600s ±10%, misses remembered 5s, deletes 1s. Copies compare hashes every 30s.
+- Save: none. Restart = empty + warm from copies. Add disk save only if restart loss hurts.
+- Use Memcached-style striped LRU per `caching/references/providers/generic.md`.
 
 ## 9. Key decisions & trade-offs
 
-Every row below is a deal you make with eyes open — what you gain, what you pay, and the tripwire that tells you to renegotiate.
+Each row is a trade: gain, pain, when to change.
 
 | Decision | Solves (cite FR/NFR/verdict) | Worsens (non-empty, blocking) | Change it when (breaking point) |
 |---|---|---|---|
@@ -205,7 +204,7 @@ Every row below is a deal you make with eyes open — what you gain, what you pa
 
 ## 10. Failure modes & degradation
 
-Here's the mindset for this section: everything below *will* happen at 3am someday. The only question is whether users notice. Per `resilience-failure` (timeout: give up waiting after X; breaker (circuit breaker: stop calling what is failing, fail fast, probe later); bulkhead (separate pools per dependency so one slow thing cannot hog every thread); degrade) + `load-balancing` health-gating (only send traffic to boxes passing health checks); money paths n/a (cache fail-open; origin, if any, fail-closed).
+Mindset: all of this will happen. Users should not notice.
 
 | Failure | User sees | Degrade path | Recovery (no stampede) |
 |---|---|---|---|
@@ -218,15 +217,15 @@ Here's the mindset for this section: everything below *will* happen at 3am somed
 | Config quorum loss (members) | No membership change (reads/writes continue on last ring) | Freeze ring, read-only mode for topology | Majority restore; no data-plane freeze |
 | Penetration (missing-key flood) | Higher shard CPU | Negative cache 5s + Bloom (Bloom filter: tiny probably-seen set, never misses a true seen, sometimes false-alarms) in lib | Rate-limit per client (`429+Retry-After`) |
 
-Timeouts (fit 5ms p99 GET budget: 1ms client→router + 2ms router→shard + 1ms shard work + 1ms slack): router→shard 2ms, client→router 1ms, shard→replica async (no block: fire and move on). Retries: max 2 idempotent (safe to repeat: twice changes nothing) GET/PUT with jitter (randomized delay spread so retries do not march in lockstep) + per-request budget (hard cap on total tries per request); breaker opens at 50% 5xx (server-error responses) /10s.
+Fit in 5ms: 1ms client→router + 2ms router→shard + 1ms work + 1ms slack. Retry GET/PUT max 2 with spread. Open breaker at 50% errors/10s.
 
 ## 11. Scale evolution (10× / 100×)
 
-So what breaks first when you win and traffic 10×s? Good news: you already know. Current bottleneck + signals per `scaling-evolution` (walk-the-ladder: add only the next tier the numbers force, and name what breaks next): RAM capacity (3.36 TB / 36 nodes) before QPS; signals `ram_used >75%` (memory fill share), `hit_ratio <90%` (share of requests answered from cache), `eviction_rate` rising, `p99_GET >5ms`.
+RAM fills before QPS. Watch `ram_used`, `hit_ratio`, `eviction_rate`, `p99_GET`.
 
 - 10× (≈23M peak, 10B keys, ~11 TB live / 33 TB with r=3): split shards to ~120 primaries / ~360 physical by consistent-hash add (only ~K/N move); add L1 in-process in client lib for top-0.1% hot keys; isolate hot-key replicas; move `Members` to dedicated quorum (3–5 nodes); add per-tenant rate limits. Signal to act: `per-primary QPS >150k` or `RAM >80%` for 10 min.
 - 100× (≈230M peak, 100B keys): cell split by namespace/prefix (federate rings per tenant/prefix, per `data-storage` federation (split by function/domain) before further sharding); multi-DC (data center) active-active with async cross-DC replicate (eventual, LWW + version vectors (per-copy counters that reveal who saw what) for conflicts); introduce origin spillover + `blob-store` for >1MB values; add `distributed-search` only if value-query appears (else still deferred). Signal: single ring gossip >5s or cross-DC RTT (round-trip time) dominates p99.
-- What metric says it is time: `hit_ratio`, `eviction_rate`, `per-shard QPS/RAM skew`, `replica_lag_ms`, `ring_convergence_s`. This design holds until live RAM exceeds ~3 TB/cluster or peak exceeds ~2.5M QPS per 32-node cell; beyond that add cells, not bigger nodes. That's the whole scaling story: same shape, more cells.
+- What metric says it is time: `hit_ratio`, `eviction_rate`, lag, ring speed. Holds until ~3 TB or ~2.5M QPS per cell. Then add cells, not bigger boxes.
 
 ## 12. Open questions + validation
 
@@ -241,4 +240,4 @@ Open: confirm DAU/ops (50M×2000 assumed), value-size p50 (median) /p99 (1KB ass
 - [x] No managed-service names/quotas unless user named a cloud (generic only).
 - [x] Weakest dimension + current bottleneck + next-magnitude change stated; never claims perfection.
 
-Coverage details (plain version: watch what users feel, not CPU for its own sake): `observability` SLOs: 99.9% GET <5ms p99, PUT <10ms p99, hit_ratio >90% over 5m; RED (rate, errors, duration: the request lens) for routers/shards, USE (utilization, saturation, errors: the resource lens) for RAM/CPU/net; `livez` (am-I-alive probe: restart me if it fails) vs `readyz` (am-I-ready probe: quietly pull me from rotation if it fails; checks ring+memory, not downstream, to avoid flap (rapid in-out flapping)); symptom alert on SLO burn (budget spend rate), tickets on saturation; telemetry async+sampled (sent in background, 1 in N kept). `distributed-logging`: structured JSON per router/shard sampled 1%, `request_id`+`key_hash` (not raw key) correlation (tying lines from one request together), async ship, 7d retain. Weakest dimension, if we're being honest: replica-loss window (writes a dead primary had not copied yet) + approximate recency; current bottleneck RAM capacity; next change: shard split + hot-key L1 at 10×. No design is perfect — this one just tells you exactly where it bends.
+Coverage: SLOs 99.9% GET <5ms, PUT <10ms, hit >90%. Watch RED (requests) + USE (resources). `livez` = restart me, `readyz` = pull me out quietly. Logs: sampled JSON with IDs, 7d. Weak spot: loss window + approximate order. Next: split shards + client cache at 10×.
